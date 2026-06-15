@@ -126,11 +126,37 @@ Scores below this fall into the `low' bucket."
   :type 'integer
   :group 'agent-shell-model-router)
 
+(defcustom agent-shell-model-router-baseline-score 3
+  "Starting complexity score before any signal is counted (Layer B).
+
+The default of 3 equals the default `agent-shell-model-router-medium-threshold',
+so a prompt with no complexity signals routes to the medium model rather
+than the cheapest one: when classification is uncertain, prefer a
+stronger model than necessary.  Trivial signals can still pull the score
+below the medium threshold.  Set to 0 to restore the previous fail-low
+behavior (unsignalled prompts go to the `low' model)."
+  :type 'integer
+  :group 'agent-shell-model-router)
+
 (defcustom agent-shell-model-router-complex-keywords
   '("design" "architect" "architecture" "refactor" "debug" "investigate"
     "optimize" "optimise" "prove" "analyze" "analyse" "race" "deadlock"
     "concurrency" "security" "review" "tradeoff" "plan" "benchmark")
-  "Verbs/nouns that signal a more complex request (raise the score)."
+  "Verbs/nouns that signal a more complex request (raise the score).
+Matched as whole-word stems (case-insensitive), so \"debug\" also matches
+\"debugging\" and \"debugger\"."
+  :type '(repeat string)
+  :group 'agent-shell-model-router)
+
+(defcustom agent-shell-model-router-strong-complex-keywords
+  '("security" "vulnerability" "exploit" "auth" "concurrency" "deadlock"
+    "race" "architecture" "migration" "prove" "audit")
+  "Keywords that force the `high' bucket regardless of the numeric score.
+
+These name high-stakes domains where routing to a weaker model is most
+costly, so their mere presence promotes the prompt to the strongest model
+\(conservative bias).  Matched as whole-word stems (case-insensitive), so
+\"deadlock\" also matches \"deadlocking\"."
   :type '(repeat string)
   :group 'agent-shell-model-router)
 
@@ -183,6 +209,16 @@ Matching is case-insensitive."
   (let ((case-fold-search t))
     (string-match-p (concat "\\b" (regexp-quote word) "\\b") text)))
 
+(defun agent-shell-model-router--stem-match-p (word text)
+  "Return non-nil when WORD appears as a whole-word prefix in TEXT.
+Unlike `agent-shell-model-router--word-match-p', the trailing word
+boundary is not required, so a stem like \"debug\" also matches
+\"debugging\" / \"debugger\".  Matching is case-insensitive.  Used for
+complex-keyword matching, where over-matching only ever promotes to a
+stronger model (the conservative direction)."
+  (let ((case-fold-search t))
+    (string-match-p (concat "\\b" (regexp-quote word)) text)))
+
 (defun agent-shell-model-router--word-count (prompt)
   "Return the number of whitespace-separated words in PROMPT."
   (length (split-string prompt "[ \t\n]+" t)))
@@ -212,9 +248,13 @@ Matching is case-insensitive."
         (and regexp (string-match-p regexp prompt))
         (and (functionp predicate) (funcall predicate prompt)))))
 
-(defun agent-shell-model-router--complexity-bucket (score)
-  "Return the bucket symbol (`high'/`medium'/`low') for SCORE."
-  (cond ((>= score agent-shell-model-router-high-threshold) 'high)
+(defun agent-shell-model-router--complexity-bucket (score &optional force-high)
+  "Return the bucket symbol (`high'/`medium'/`low') for SCORE.
+When FORCE-HIGH is non-nil, return `high' regardless of SCORE -- used by
+the strong-complex keyword override so a high-stakes prompt is never
+under-routed."
+  (cond (force-high 'high)
+        ((>= score agent-shell-model-router-high-threshold) 'high)
         ((>= score agent-shell-model-router-medium-threshold) 'medium)
         (t 'low)))
 
@@ -222,31 +262,53 @@ Matching is case-insensitive."
 
 (defun agent-shell-model-router-complexity-score (prompt)
   "Return an integer complexity score for PROMPT (Layer B).
-Higher means more complex.  Purely heuristic -- no model is called."
-  (let ((case-fold-search t)
-        (score 0)
-        (words (agent-shell-model-router--word-count prompt)))
+Higher means more complex.  Purely heuristic -- no model is called.
+
+Scoring starts from `agent-shell-model-router-baseline-score', so a prompt
+with no signals lands in the medium bucket (conservative: an unknown
+prompt is routed to a capable model, not the cheapest one).  Complex
+signals raise the score; trivial signals lower it, but only when no
+competing complexity signal is present, so a lone trivial verb cannot mask
+a genuinely complex request."
+  (let* ((case-fold-search t)
+         (score agent-shell-model-router-baseline-score)
+         (words (agent-shell-model-router--word-count prompt))
+         (code-hit (string-match-p "```" prompt))
+         (multi-step (string-match-p "^[ \t]*[0-9]+[.)]" prompt))
+         (complex-hit
+          (seq-some (lambda (w)
+                      (agent-shell-model-router--stem-match-p w prompt))
+                    agent-shell-model-router-complex-keywords))
+         (trivial-hit
+          (seq-some (lambda (w)
+                      (agent-shell-model-router--word-match-p w prompt))
+                    agent-shell-model-router-trivial-keywords)))
     ;; Length.
     (cond ((> words 120) (cl-incf score 3))
           ((> words 60)  (cl-incf score 2))
           ((> words 25)  (cl-incf score 1)))
     ;; Fenced code blocks.
-    (when (string-match-p "```" prompt) (cl-incf score 2))
+    (when code-hit (cl-incf score 2))
     ;; File references / @-mentions (capped).
     (cl-incf score (min 2 (agent-shell-model-router--count-references prompt)))
     ;; Enumerated / multi-step request.
-    (when (string-match-p "^[ \t]*[0-9]+[.)]" prompt) (cl-incf score 1))
-    ;; Complex intent verbs.
-    (when (seq-some (lambda (w)
-                      (agent-shell-model-router--word-match-p w prompt))
-                    agent-shell-model-router-complex-keywords)
-      (cl-incf score 2))
-    ;; Trivial intent verbs pull the score down.
-    (when (seq-some (lambda (w)
-                      (agent-shell-model-router--word-match-p w prompt))
-                    agent-shell-model-router-trivial-keywords)
+    (when multi-step (cl-incf score 1))
+    ;; Complex intent verbs (stem-matched: \"debugging\" counts as \"debug\").
+    (when complex-hit (cl-incf score 2))
+    ;; Trivial intent verbs pull the score down -- but only when there is no
+    ;; competing complexity signal, so complex always dominates trivial.
+    (when (and trivial-hit (not complex-hit) (not code-hit) (not multi-step))
       (cl-decf score 2))
     (max 0 score)))
+
+(defun agent-shell-model-router--strong-complex-p (prompt)
+  "Return non-nil when PROMPT contains a strong-complex keyword.
+Such keywords force the `high' bucket regardless of the numeric score
+\(see `agent-shell-model-router-strong-complex-keywords')."
+  (let ((case-fold-search t))
+    (seq-some (lambda (w)
+                (agent-shell-model-router--stem-match-p w prompt))
+              agent-shell-model-router-strong-complex-keywords)))
 
 (defun agent-shell-model-router-classify (prompt)
   "Return a routing decision for PROMPT, or nil to keep the current model.
@@ -266,13 +328,15 @@ Layer B complexity buckets (`agent-shell-model-router-complexity-models')."
      ;; Layer B -- complexity buckets.
      (when agent-shell-model-router-complexity-models
        (let* ((score (agent-shell-model-router-complexity-score prompt))
-              (bucket (agent-shell-model-router--complexity-bucket score))
+              (strong (agent-shell-model-router--strong-complex-p prompt))
+              (bucket (agent-shell-model-router--complexity-bucket score strong))
               (model (alist-get bucket
                                 agent-shell-model-router-complexity-models)))
          (when model
            (list :model model
                  :category (format "complexity:%s" bucket)
-                 :reason (format "score %d -> %s" score bucket))))))))
+                 :reason (format "score %d -> %s%s" score bucket
+                                 (if strong " (strong-complex)" "")))))))))
 
 ;;;; Guard
 

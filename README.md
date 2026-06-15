@@ -39,8 +39,10 @@ Map matchers to models:
 
 Scores prompts as `high` / `medium` / `low` by:
 - word count, code blocks, file refs, `@` mentions, step indicators
-- "complex" verbs (design, refactor, debug) raise score
-- "trivial" verbs (typo, rename, format) lower it
+- "complex" verbs (design, refactor, debug) raise score — stem-matched, so `debugging` counts
+- "trivial" verbs (typo, rename, format) lower it — but only when no complex signal competes
+
+**Conservative by design.** Scoring starts from a baseline (`agent-shell-model-router-baseline-score`, default `3` = the medium bucket), so a prompt with *no* signal routes to the medium model rather than the cheapest — when classification is uncertain, it errs toward the stronger model. Demoting to the `low` model requires positive evidence of triviality. **Strong-complex keywords** (`security`, `concurrency`, `deadlock`, `auth`, …) force the `high` bucket outright. Set the baseline to `0` to restore plain fail-low scoring.
 
 Disabled if `agent-shell-model-router-complexity-models` is `nil`.
 
@@ -92,8 +94,10 @@ Requires `agent-shell` and `acp`.
 |----------------------------------------------|---------|-----------------------------------------------|
 | `agent-shell-model-router-rules`             | `nil`   | Layer A rules                                 |
 | `agent-shell-model-router-complexity-models` | `nil`   | Layer B buckets (nil = off)                  |
+| `agent-shell-model-router-baseline-score`    | `3`     | starting score (0 = fail-low)                |
 | `agent-shell-model-router-high-threshold`    | `6`     | score ≥ this → `high`                        |
-| `agent-shell-model-router-complex-keywords`  | list    | words that raise score                        |
+| `agent-shell-model-router-complex-keywords`  | list    | words that raise score (stem-matched)        |
+| `agent-shell-model-router-strong-complex-keywords` | list | words that force `high`                  |
 | `agent-shell-model-router-trivial-keywords`  | list    | words that lower score                        |
 | `agent-shell-model-router-min-words`         | `0`     | skip routing if prompt is shorter            |
 | `agent-shell-model-router-verbose`           | `t`     | log routing decisions                         |
