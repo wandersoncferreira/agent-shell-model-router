@@ -287,29 +287,51 @@ Layer B complexity buckets (`agent-shell-model-router-complexity-models')."
 
 ;;;; Model switching (generic, based on agent-shell/acp internals)
 
+(defun agent-shell-model-router--available-models (shell-buffer)
+  "Return available models in SHELL-BUFFER as a list of (:name :model-id) alists.
+
+Handles two ACP shapes: the legacy `(:session :models)' list, and newer
+servers (e.g. current Claude Code) that expose models only as the
+\"model\" entry under `(:session :config-options)', where each option's
+`:value' is the model-id and `:name' its display name.  Returns nil when
+SHELL-BUFFER is not a live agent-shell."
+  (when (buffer-live-p shell-buffer)
+    (with-current-buffer shell-buffer
+      (or
+       ;; Legacy shape: list of maps already keyed by :name / :model-id.
+       (map-nested-elt agent-shell--state '(:session :models))
+       ;; Newer shape: config-options -> "model" select -> :options.
+       (when-let* ((model-opt
+                    (seq-find
+                     (lambda (opt) (equal (map-elt opt :id) "model"))
+                     (map-nested-elt agent-shell--state
+                                     '(:session :config-options)))))
+         (mapcar (lambda (opt)
+                   (list (cons :name (map-elt opt :name))
+                         (cons :model-id (map-elt opt :value))))
+                 (map-elt model-opt :options)))))))
+
 (defun agent-shell-model-router--resolve-model-id (shell-buffer model-name)
   "Return the model-id whose display name contains MODEL-NAME in SHELL-BUFFER.
 MODEL-NAME is substring-matched (case-sensitively, as model names are)
 against the session's available model display names.  Return nil when no
 model matches or SHELL-BUFFER is not a live agent-shell."
   (when (and model-name (buffer-live-p shell-buffer))
-    (with-current-buffer shell-buffer
-      (let ((target (seq-find
-                     (lambda (m)
-                       (string-match-p (regexp-quote model-name)
-                                       (or (map-elt m :name) "")))
-                     (map-nested-elt agent-shell--state '(:session :models)))))
-        (and target (map-elt target :model-id))))))
+    (let ((target (seq-find
+                   (lambda (m)
+                     (string-match-p (regexp-quote model-name)
+                                     (or (map-elt m :name) "")))
+                   (agent-shell-model-router--available-models shell-buffer))))
+      (and target (map-elt target :model-id)))))
 
 (defun agent-shell-model-router--model-name (shell-buffer model-id)
   "Return the display name for MODEL-ID in SHELL-BUFFER, or MODEL-ID itself."
-  (or (and model-id (buffer-live-p shell-buffer)
-           (with-current-buffer shell-buffer
-             (when-let* ((m (seq-find
-                             (lambda (m) (equal (map-elt m :model-id) model-id))
-                             (map-nested-elt agent-shell--state
-                                             '(:session :models)))))
-               (map-elt m :name))))
+  (or (and model-id
+           (when-let* ((m (seq-find
+                           (lambda (m) (equal (map-elt m :model-id) model-id))
+                           (agent-shell-model-router--available-models
+                            shell-buffer))))
+             (map-elt m :name)))
       model-id))
 
 (defun agent-shell-model-router--switch-to-id (shell-buffer model-id on-done)
@@ -321,9 +343,33 @@ failure).  ON-DONE is ALWAYS called exactly once."
   (if (not (and model-id (buffer-live-p shell-buffer)))
       (funcall on-done nil)
     (with-current-buffer shell-buffer
-      (let ((current-id (map-nested-elt agent-shell--state '(:session :model-id))))
-        (if (equal model-id current-id)
-            (funcall on-done nil)
+      (let ((current-id (if (fboundp 'agent-shell--current-model-id)
+                            ;; agent-shell--state is both a defvar-local AND a defun:
+                            ;; call the function to get the current live state.
+                            (agent-shell--current-model-id (agent-shell--state))
+                          (map-nested-elt (if (fboundp 'agent-shell--state)
+                                              (agent-shell--state)
+                                            agent-shell--state)
+                                          '(:session :model-id)))))
+        (cond
+         ((equal model-id current-id)
+          (funcall on-done nil))
+         ;; Newer agent-shell exposes a version-agnostic setter that uses
+         ;; `session/set_config_option' (configId "model") when the agent
+         ;; advertises it -- as @agentclientprotocol/claude-agent-acp >= 0.44
+         ;; does -- and only falls back to the legacy `session/set_model'
+         ;; request when no "model" config-option exists.  Prefer it so we
+         ;; never send a `session/set_model' the agent answers with -32601.
+         ((fboundp 'agent-shell--config-option-set-model-id)
+          (agent-shell--config-option-set-model-id
+           :model-id model-id
+           :on-success (lambda () (funcall on-done t))
+           :on-failure (lambda (acp-error _raw-message)
+                         (message "agent-shell-model-router: model switch failed: %s"
+                                  acp-error)
+                         (funcall on-done nil))))
+         ;; Legacy agent-shell (no config-option helper): direct request.
+         (t
           (agent-shell--send-request
            :state agent-shell--state
            :client (map-elt agent-shell--state :client)
@@ -345,7 +391,7 @@ failure).  ON-DONE is ALWAYS called exactly once."
            (lambda (acp-error _raw-message)
              (message "agent-shell-model-router: model switch failed: %s"
                       acp-error)
-             (funcall on-done nil))))))))
+             (funcall on-done nil)))))))))
 
 (defun agent-shell-model-router--restore-on-turn-complete (shell-buffer model-id)
   "Restore SHELL-BUFFER's model to MODEL-ID once the current turn completes.
@@ -397,8 +443,10 @@ model is restored once the agent finishes the turn."
         (if (null decision)
             (funcall run)
           (let ((prev-id (with-current-buffer shell-buffer
-                           (map-nested-elt agent-shell--state
-                                           '(:session :model-id))))
+                           (if (fboundp 'agent-shell--current-model-id)
+                               (agent-shell--current-model-id (agent-shell--state))
+                             (map-nested-elt agent-shell--state
+                                             '(:session :model-id)))))
                 (target-id (agent-shell-model-router--resolve-model-id
                             shell-buffer (plist-get decision :model))))
             (when agent-shell-model-router-verbose
