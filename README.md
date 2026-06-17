@@ -42,7 +42,12 @@ Scores prompts as `high` / `medium` / `low` by:
 - "complex" verbs (design, refactor, debug) raise score — stem-matched, so `debugging` counts
 - "trivial" verbs (typo, rename, format) lower it — but only when no complex signal competes
 
-**Conservative by design.** Scoring starts from a baseline (`agent-shell-model-router-baseline-score`, default `3` = the medium bucket), so a prompt with *no* signal routes to the medium model rather than the cheapest — when classification is uncertain, it errs toward the stronger model. Demoting to the `low` model requires positive evidence of triviality. **Strong-complex keywords** (`security`, `concurrency`, `deadlock`, `auth`, …) force the `high` bucket outright. Set the baseline to `0` to restore plain fail-low scoring.
+**Conservative by default.** Scoring starts from a baseline (`agent-shell-model-router-baseline-score`, default `3` = the medium bucket), so a prompt with *no* signal routes to the medium model rather than the cheapest. Demoting to `low` requires positive evidence of triviality. Two signals force the `high` bucket outright regardless of score:
+
+- **Strong-complex keywords** (`security`, `concurrency`, `deadlock`, `auth`, …)
+- **Artifact creation** — a creation verb (`create`, `write`, `generate`, …) paired with an artifact noun (`pr`, `doc`, `rfc`, `migration`, …). Covers "create a PR", "write a document", "generate a report", etc. Both lists are customisable via `agent-shell-model-router-creation-verbs` and `agent-shell-model-router-creation-artifact-keywords`.
+
+Set the baseline to `0` to restore plain fail-low scoring.
 
 Disabled if `agent-shell-model-router-complexity-models` is `nil`.
 
@@ -98,6 +103,8 @@ Requires `agent-shell` and `acp`.
 | `agent-shell-model-router-high-threshold`    | `6`     | score ≥ this → `high`                        |
 | `agent-shell-model-router-complex-keywords`  | list    | words that raise score (stem-matched)        |
 | `agent-shell-model-router-strong-complex-keywords` | list | words that force `high`                  |
+| `agent-shell-model-router-creation-verbs`    | list    | creation verbs (force `high` when paired with artifact) |
+| `agent-shell-model-router-creation-artifact-keywords` | list | artifact nouns (force `high` when paired with creation verb) |
 | `agent-shell-model-router-trivial-keywords`  | list    | words that lower score                        |
 | `agent-shell-model-router-min-words`         | `0`     | skip routing if prompt is shorter            |
 | `agent-shell-model-router-verbose`           | `t`     | log routing decisions                         |

@@ -95,6 +95,15 @@ Each rule is a plist with the following keys:
               prompt (case-insensitive).
   :predicate  Optional function of one argument (the prompt string)
               returning non-nil on a match.
+  :strategy   Symbol controlling how the model is applied.
+              `switch' (default) switches the current session to the
+              target model for the turn, then restores the previous
+              model when the turn completes (or permanently when
+              `agent-shell-model-router-restore-after-turn' is nil).
+              `ephemeral' creates a fresh ACP session on the same
+              client, routes the turn through it at the target model,
+              then deletes the session on turn-complete.  The main
+              session is never touched; there is nothing to restore.
 
 A rule matches when ANY of its provided matchers matches.  Rules are
 tried in order and the first match wins."
@@ -113,6 +122,19 @@ When nil, the complexity layer is disabled: if no Layer A rule
 matches, the current model is kept."
   :type '(alist :key-type (choice (const high) (const medium) (const low))
                 :value-type string)
+  :group 'agent-shell-model-router)
+
+(defcustom agent-shell-model-router-complexity-ephemeral-buckets nil
+  "List of complexity buckets that should use an ephemeral session (Layer B).
+
+When a bucket listed here is selected by Layer B, the router creates a
+temporary ACP session for the turn instead of switching the main session's
+model.  The main session model is never modified.
+
+Example — run medium and low complexity prompts in ephemeral sessions:
+
+  (setq agent-shell-model-router-complexity-ephemeral-buckets \\='(medium low))"
+  :type '(repeat (choice (const high) (const medium) (const low)))
   :group 'agent-shell-model-router)
 
 (defcustom agent-shell-model-router-high-threshold 6
@@ -163,6 +185,27 @@ costly, so their mere presence promotes the prompt to the strongest model
 (defcustom agent-shell-model-router-trivial-keywords
   '("typo" "rename" "format" "fmt" "lint" "indent" "docstring" "comment")
   "Verbs/nouns that signal a trivial request (lower the score)."
+  :type '(repeat string)
+  :group 'agent-shell-model-router)
+
+(defcustom agent-shell-model-router-creation-verbs
+  '("create" "write" "generate" "make" "prepare")
+  "Verbs that indicate artifact creation.
+When any of these appears alongside a noun from
+`agent-shell-model-router-creation-artifact-keywords', the prompt is
+forced into the `high' complexity bucket regardless of its numeric score.
+Matched as whole-word stems (case-insensitive)."
+  :type '(repeat string)
+  :group 'agent-shell-model-router)
+
+(defcustom agent-shell-model-router-creation-artifact-keywords
+  '("pr" "pull request" "document" "doc" "rfc" "adr" "ticket" "issue"
+    "report" "presentation" "deck" "migration" "readme" "changelog"
+    "proposal" "spec")
+  "Artifact nouns that, paired with a creation verb, force the `high' bucket.
+Multi-word entries (e.g. \"pull request\") are matched as substrings;
+single-word entries are matched as whole words (case-insensitive).
+See `agent-shell-model-router-creation-verbs'."
   :type '(repeat string)
   :group 'agent-shell-model-router)
 
@@ -310,6 +353,22 @@ Such keywords force the `high' bucket regardless of the numeric score
                 (agent-shell-model-router--stem-match-p w prompt))
               agent-shell-model-router-strong-complex-keywords)))
 
+(defun agent-shell-model-router--creation-p (prompt)
+  "Return non-nil when PROMPT requests creation of a named artifact.
+Requires both a creation verb (from `agent-shell-model-router-creation-verbs')
+and an artifact noun (from `agent-shell-model-router-creation-artifact-keywords')
+to be present.  The conjunction avoids false positives from bare nouns
+\(\"reviewed the PR\") or bare verbs (\"create a variable\")."
+  (let ((case-fold-search t))
+    (and (seq-some (lambda (v)
+                     (agent-shell-model-router--stem-match-p v prompt))
+                   agent-shell-model-router-creation-verbs)
+         (seq-some (lambda (a)
+                     (if (string-match-p " " a)
+                         (string-match-p (regexp-quote a) prompt)
+                       (agent-shell-model-router--word-match-p a prompt)))
+                   agent-shell-model-router-creation-artifact-keywords))))
+
 (defun agent-shell-model-router-classify (prompt)
   "Return a routing decision for PROMPT, or nil to keep the current model.
 
@@ -322,21 +381,28 @@ Layer B complexity buckets (`agent-shell-model-router-complexity-models')."
      (cl-loop for rule in agent-shell-model-router-rules
               when (agent-shell-model-router--rule-matches-p rule prompt)
               return (list :model (plist-get rule :model)
+                           :strategy (plist-get rule :strategy)
                            :category (or (plist-get rule :name) "rule")
                            :reason (format "rule %S"
                                            (or (plist-get rule :name) "?"))))
      ;; Layer B -- complexity buckets.
      (when agent-shell-model-router-complexity-models
        (let* ((score (agent-shell-model-router-complexity-score prompt))
-              (strong (agent-shell-model-router--strong-complex-p prompt))
+              (strong (or (agent-shell-model-router--strong-complex-p prompt)
+                          (agent-shell-model-router--creation-p prompt)))
               (bucket (agent-shell-model-router--complexity-bucket score strong))
               (model (alist-get bucket
                                 agent-shell-model-router-complexity-models)))
          (when model
            (list :model model
+                 :strategy (when (memq bucket agent-shell-model-router-complexity-ephemeral-buckets)
+                             'ephemeral)
                  :category (format "complexity:%s" bucket)
-                 :reason (format "score %d -> %s%s" score bucket
-                                 (if strong " (strong-complex)" "")))))))))
+                 :reason (format "score %d -> %s%s%s" score bucket
+                                 (if (agent-shell-model-router--strong-complex-p prompt)
+                                     " (strong-complex)" "")
+                                 (if (agent-shell-model-router--creation-p prompt)
+                                     " (creation)" "")))))))))
 
 ;;;; Guard
 
@@ -480,6 +546,84 @@ unsubscribes and switches the session back to MODEL-ID."
                              (agent-shell-model-router--model-name
                               shell-buffer model-id)))))))))))
 
+;;;; Ephemeral-session routing
+
+(defun agent-shell-model-router--run-ephemeral (shell-buffer target-id orig-fn args)
+  "Route one prompt turn through a disposable session set to TARGET-ID.
+
+Creates a new ACP session on the same client as SHELL-BUFFER,
+patches the buffer's session-id to point at it, switches that
+session's model to TARGET-ID, then calls ORIG-FN with ARGS.
+The main session model is never changed.  On `turn-complete',
+restores the original session-id and model-id in state, then
+deletes the ephemeral session.
+
+Falls back to calling ORIG-FN on the original session when
+session creation fails."
+  (with-current-buffer shell-buffer
+    (let* ((client (map-elt agent-shell--state :client))
+           (session (map-elt agent-shell--state :session))
+           (original-id (map-elt session :id))
+           (original-model-id (map-elt session :model-id)))
+      (agent-shell--send-request
+       :state agent-shell--state
+       :client client
+       :request (acp-make-session-new-request
+                 :cwd (agent-shell--resolve-path (agent-shell-cwd)))
+       :buffer shell-buffer
+       :on-success
+       (lambda (acp-response)
+         (with-current-buffer shell-buffer
+           (let ((ephemeral-id (map-elt acp-response 'sessionId)))
+             (if (not ephemeral-id)
+                 (progn
+                   (message "agent-shell-model-router: session/new returned no sessionId; routing normally")
+                   (apply orig-fn args))
+               ;; Patch the in-place session plist to use the ephemeral id.
+               ;; The model list and other config stay the same (same agent).
+               (map-put! session :id ephemeral-id)
+               (agent-shell-model-router--switch-to-id
+                shell-buffer target-id
+                (lambda (_switched)
+                  (with-current-buffer shell-buffer
+                    ;; One-shot cleanup on turn-complete.
+                    (let (sub-token)
+                      (setq sub-token
+                            (agent-shell-subscribe-to
+                             :shell-buffer shell-buffer
+                             :event 'turn-complete
+                             :on-event
+                             (lambda (_event)
+                               (when sub-token
+                                 (agent-shell-unsubscribe :subscription sub-token))
+                               (with-current-buffer shell-buffer
+                                 ;; Restore original session identity.
+                                 (map-put! session :id original-id)
+                                 (map-put! session :model-id original-model-id)
+                                 (when (fboundp 'agent-shell--update-header-and-mode-line)
+                                   (agent-shell--update-header-and-mode-line))
+                                 ;; Delete the ephemeral session.
+                                 (agent-shell--send-request
+                                  :state agent-shell--state
+                                  :client client
+                                  :request (acp-make-session-delete-request
+                                            :session-id ephemeral-id)
+                                  :buffer shell-buffer
+                                  :on-success
+                                  (lambda (_)
+                                    (when agent-shell-model-router-verbose
+                                      (message "agent-shell-model-router: ephemeral session deleted")))
+                                  :on-failure
+                                  (lambda (err _)
+                                    (message "agent-shell-model-router: ephemeral session/delete failed: %s"
+                                             err))))))))
+                    (apply orig-fn args))))))))
+       :on-failure
+       (lambda (err _)
+         (message "agent-shell-model-router: session/new failed (%s), routing normally" err)
+         (with-current-buffer shell-buffer
+           (apply orig-fn args)))))))
+
 ;;;; The around advice
 
 (defun agent-shell-model-router--around-send (orig-fn &rest args)
@@ -523,15 +667,18 @@ model is restored once the agent finishes the turn."
                     (message "agent-shell-model-router: no model matching %S"
                              (plist-get decision :model)))
                   (funcall run))
-              (agent-shell-model-router--switch-to-id
-               shell-buffer target-id
-               (lambda (switched)
-                 (when (and switched
-                            agent-shell-model-router-restore-after-turn
-                            (not (equal prev-id target-id)))
-                   (agent-shell-model-router--restore-on-turn-complete
-                    shell-buffer prev-id))
-                 (funcall run))))))))))
+              (if (eq (plist-get decision :strategy) 'ephemeral)
+                  (agent-shell-model-router--run-ephemeral
+                   shell-buffer target-id orig-fn args)
+                (agent-shell-model-router--switch-to-id
+                 shell-buffer target-id
+                 (lambda (switched)
+                   (when (and switched
+                              agent-shell-model-router-restore-after-turn
+                              (not (equal prev-id target-id)))
+                     (agent-shell-model-router--restore-on-turn-complete
+                      shell-buffer prev-id))
+                   (funcall run)))))))))))
 
 ;;;; Inspection commands
 
